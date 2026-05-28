@@ -1,0 +1,58 @@
+[
+  {
+    "employee_id": "123",
+    "name": "Saurabh Solanki",
+    "timestamp": "2026-05-28T01:50:05.666537",
+    "synced": true
+  },
+  {
+    "employee_id": "123",
+    "name": "Saurabh Solanki",
+    "timestamp": "2026-05-28T01:51:25.854514",
+    "synced": true
+  },
+  {
+    "employee_id": "230121021",
+    "name": "gani",
+    "timestamp": "2026-05-28T01:51:47.288186",
+    "synced": true
+  },
+  {
+    "employee_id": "5423",
+    "name": "Sanket",
+    "timestamp": "2026-05-28T12:47:20.763014",
+    "synced": false
+  },
+  {
+    "employee_id": "231",
+    "name": "Saurabh Solanki",
+    "timestamp": "2026-05-28T12:48:17.133241",
+    "synced": false
+  },
+  {
+    "employee_id": "231",
+    "name": "Saurabh Solanki",
+    "timestamp": "2026-05-28T13:02:13.455366",
+    "synced": false
+  },
+  {
+    "employee_id": "2312423",
+    "name": "Saurabh SOlanki",
+    "timestamp": "2026-05-28T13:02:27.954993",
+    "synced": false
+  },
+  {
+    "employee_id": "123",
+    "name": "Saurabh Solanki",
+    "timestamp": "2026-05-28T13:22:28.548439",
+    "date": "2026-05-28",
+    "time": "13:22:28",
+    "latitude": 28.6189,
+    "longitude": 77.3262,
+    "location": "Gharroli, National Capital Territory of Delhi (28.6189, 77.3262)",
+    "city": "Gharroli",
+    "region": "National Capital Territory of Delhi",
+    "country": "India",
+    "synced": false
+  }
+]
