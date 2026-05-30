@@ -29,6 +29,7 @@ import {
   computeTextureProxy,
   computeGlareProxy,
 } from '@/modules/face-auth/frameAnalysis';
+import { matchFace } from '@/modules/face-auth/vectorMath';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 const FRAME_SIZE = Math.min(SCREEN_W - 64, 300);
@@ -90,11 +91,17 @@ export default function EnrollScreen() {
   const lastFaceY = useSharedValue(-1);
   const movementSum = useSharedValue(0);
   const embeddingCount = useSharedValue(0);
+  const frameCount = useSharedValue(0);
 
   // ─── Refs (JS thread only) ────────────────────────────────
   const embeddingBuffer = useRef<number[][]>([]);
   const formDataRef = useRef({ name: '', empId: '', phone: '' });
   formDataRef.current = { name, empId, phone };
+
+  // Log model loading state changes on JS Thread
+  React.useEffect(() => {
+    console.log(`[FaceAuth] Models Status Changed - BlazeFace: ${blazeFace.state}, FaceNet: ${faceNet.state}`);
+  }, [blazeFace.state, faceNet.state]);
 
   // ─── Bridges: worklet → JS thread ─────────────────────────
   const updateStatusJS = useCallback((text: string, prog: number) => {
@@ -105,8 +112,10 @@ export default function EnrollScreen() {
   const handleEmbeddingJS = useCallback((embedding: number[]) => {
     embeddingBuffer.current.push(embedding);
     const count = embeddingBuffer.current.length;
+    console.log(`[FaceAuth] [JS Thread] Embedding sample received. Count: ${count}/5. Vector dimensions: ${embedding.length}`);
 
     if (count >= 5) {
+      console.log(`[FaceAuth] [JS Thread] Collected 5 samples. Computing average embedding vector...`);
       // Average the 5 embeddings
       const dim = embedding.length;
       const avg = new Array(dim).fill(0);
@@ -118,9 +127,33 @@ export default function EnrollScreen() {
       for (let i = 0; i < dim; i++) norm += avg[i] * avg[i];
       norm = Math.sqrt(norm + 1e-10);
       for (let i = 0; i < dim; i++) avg[i] /= norm;
+      console.log(`[FaceAuth] [JS Thread] Normalization complete. Derived norm: ${norm.toFixed(4)}`);
 
       const { empId: eid, name: n, phone: p } = formDataRef.current;
-      databaseWrapper.saveEmployee(eid, n, p, avg);
+      console.log(`[FaceAuth] [JS Thread] Enrolling employee record: ID=${eid}, Name=${n}, Phone=${p}`);
+      
+      // Duplicate check using vectorMath's matchFace
+      const db = databaseWrapper.getEmployees();
+      const duplicateMatch = matchFace(avg, db, 0.75); // strict threshold 0.75
+      
+      if (duplicateMatch.empId) {
+        console.log(`[FaceAuth] [WARNING] Registration blocked! Duplicate face detected. Matches employee ID: ${duplicateMatch.empId} with score ${duplicateMatch.score?.toFixed(4)}.`);
+        Alert.alert(
+          'Registration Blocked',
+          `This face is already registered (Matches ID: ${duplicateMatch.empId}).`,
+          [{ text: 'OK', onPress: () => router.back() }]
+        );
+        return;
+      }
+
+      try {
+        databaseWrapper.saveEmployee(eid, n, p, avg);
+        console.log(`[FaceAuth] [JS Thread] Biometric record successfully saved to local storage!`);
+      } catch (err) {
+        console.error(`[FaceAuth] [JS Thread] [ERROR] Failed to save biometric record to DB:`, err);
+        Alert.alert('Database Error', 'Failed to save biometric data.');
+        return;
+      }
 
       setPhase('success');
       setTimeout(() => router.back(), 2500);
@@ -140,9 +173,16 @@ export default function EnrollScreen() {
         return;
       }
       if (!blazeModel || !blazeResizer) {
+        frameCount.value += 1;
+        if (frameCount.value % 60 === 1) {
+          console.log('[FaceAuth] [Worklet] Models or Resizers not fully loaded yet. Skipping frame.');
+        }
         frame.dispose();
         return;
       }
+
+      frameCount.value += 1;
+      const isThrottledFrame = frameCount.value % 30 === 0;
 
       // 1 — Resize for BlazeFace (128×128 RGB float32)
       const blazeGpuFrame = blazeResizer.resize(frame);
@@ -150,15 +190,19 @@ export default function EnrollScreen() {
 
       // 2 — Run BlazeFace inference
       const blazeOut = blazeModel.runSync([blazeInput]);
-      const faces = decodeFaces(blazeOut[0], blazeOut[1]);
-
-      // Release GPU buffer immediately after running model
-      blazeGpuFrame.dispose();
+      const faces = decodeFaces(blazeOut[0], blazeOut[1], isThrottledFrame);
 
       if (faces.length === 0) {
         stableCount.value = Math.max(0, stableCount.value - 1);
         lastFaceX.value = -1;
+        
+        if (isThrottledFrame) {
+          console.log('[FaceAuth] [Worklet] 🔍 No face detected in frame. Searching for face...');
+        }
+        
+        // Progress 0 when no face is found
         runOnJS(updateStatusJS)('Position your face in the frame', 0);
+        blazeGpuFrame.dispose(); // Release memory on early return
         frame.dispose();
         return;
       }
@@ -169,6 +213,9 @@ export default function EnrollScreen() {
       const textureVar = computeTextureProxy(blazeInput, 128, 128, face);
       const glareRat = computeGlareProxy(blazeInput, 128, 128, face);
 
+      // Now we are fully done with blazeInput, we can dispose of blazeGpuFrame
+      blazeGpuFrame.dispose();
+
       // 4 — Track face micro-movements
       const cx = (face.x1 + face.x2) / 2;
       const cy = (face.y1 + face.y2) / 2;
@@ -176,6 +223,7 @@ export default function EnrollScreen() {
       if (lastFaceX.value < 0) {
         lastFaceX.value = cx;
         lastFaceY.value = cy;
+        console.log('[FaceAuth] [Worklet] 👤 Face detected in frame. Bounding box coordinates: x1=' + face.x1.toFixed(3) + ', y1=' + face.y1.toFixed(3) + ', x2=' + face.x2.toFixed(3) + ', y2=' + face.y2.toFixed(3) + ', score=' + face.score.toFixed(3));
       } else {
         const dx = cx - lastFaceX.value;
         const dy = cy - lastFaceY.value;
@@ -195,19 +243,43 @@ export default function EnrollScreen() {
 
       const stable = stableCount.value;
 
+      if (isThrottledFrame) {
+        console.log(
+          '[FaceAuth] [Worklet] Frame #' + frameCount.value + ' | ' +
+          'TextureVar: ' + textureVar.toFixed(1) + ' (' + (textureOk ? 'PASS' : 'FAIL') + ' > 100) | ' +
+          'GlareRat: ' + glareRat.toFixed(4) + ' (' + (glareOk ? 'PASS' : 'FAIL') + ' < 0.05) | ' +
+          'StableCount: ' + stable + '/15'
+        );
+      }
+
       // ── Phase 0: Liveness verification ──────────────────
       if (capturePhase.value === 0) {
+        // Calculate dynamic unified progress: 0.0 to 0.5 based on stable count
+        const phase0Progress = (stable / 15) * 0.5;
+
         if (stable >= 15) {
           capturePhase.value = 1;
-          runOnJS(updateStatusJS)('✓ Liveness verified — capturing samples...', 1);
+          console.log('[FaceAuth] [Worklet] 🛡️ Liveness verification successful! Transitioning to Phase 1: Biometric Sample Capture.');
+          runOnJS(updateStatusJS)('✓ Liveness verified — capturing samples...', 0.5);
         } else if (!textureOk && !glareOk) {
-          runOnJS(updateStatusJS)('⚠️ Spoof detected — use a real face', stable / 15);
+          if (isThrottledFrame) {
+            console.log('[FaceAuth] [Worklet] [WARNING] Spoof / non-face texture and high screen glare detected.');
+          }
+          runOnJS(updateStatusJS)('⚠️ Spoof detected — use a real face', phase0Progress);
         } else if (!glareOk) {
-          runOnJS(updateStatusJS)('⚠️ Screen reflection detected', stable / 15);
+          if (isThrottledFrame) {
+            console.log('[FaceAuth] [Worklet] [WARNING] Glare / screen reflection detected.');
+          }
+          runOnJS(updateStatusJS)('⚠️ Screen reflection detected', phase0Progress);
+        } else if (!textureOk) {
+          if (isThrottledFrame) {
+            console.log('[FaceAuth] [Worklet] [WARNING] Low texture variance. Use a real, live face.');
+          }
+          runOnJS(updateStatusJS)('⚠️ Use a real face (Low texture)', phase0Progress);
         } else {
           runOnJS(updateStatusJS)(
             'Liveness checking... (' + stable + '/15)',
-            stable / 15
+            phase0Progress
           );
         }
         frame.dispose();
@@ -216,6 +288,9 @@ export default function EnrollScreen() {
 
       // ── Phase 1: Capture face embeddings ────────────────
       if (capturePhase.value === 1 && faceModel && faceResizer) {
+        const nextSampleIdx = embeddingCount.value + 1;
+        console.log('[FaceAuth] [Worklet] Capturing sample ' + nextSampleIdx + '/5...');
+
         // High-performance GPU center-crop via 'cover' scaleMode to target face aligned in center box
         const faceGpuFrame = faceResizer.resize(frame);
         const faceInput = faceGpuFrame.getPixelBuffer();
@@ -233,13 +308,23 @@ export default function EnrollScreen() {
 
         embeddingCount.value += 1;
         const cnt = embeddingCount.value;
-        runOnJS(updateStatusJS)('Capturing samples... (' + cnt + '/5)', 1);
+        
+        // Calculate dynamic unified progress: 0.5 to 1.0 based on embedding samples count
+        const phase1Progress = 0.5 + (cnt / 5) * 0.5;
+        
+        console.log('[FaceAuth] [Worklet] Sample ' + cnt + '/5 captured successfully. Extracted vector size: ' + emb.length);
+        runOnJS(updateStatusJS)('Capturing samples... (' + cnt + '/5)', phase1Progress);
 
         if (cnt >= 5) {
           capturePhase.value = 2;
+          console.log('[FaceAuth] [Worklet] ✅ Completed capture of all 5 embedding samples.');
         }
 
         runOnJS(handleEmbeddingJS)(emb);
+      } else if (capturePhase.value === 1) {
+        if (isThrottledFrame) {
+          console.log('[FaceAuth] [Worklet] [WARNING] Capture phase is active but FaceNet model or faceResizer is not loaded.');
+        }
       }
 
       frame.dispose();
@@ -252,8 +337,12 @@ export default function EnrollScreen() {
       Alert.alert('Missing Fields', 'Please fill in all fields.');
       return;
     }
+    console.log(`[FaceAuth] Starting biometric enrollment request for employee: ${name} (ID: ${empId}, Phone: ${phone})`);
+    
     if (!hasPermission) {
+      console.log('[FaceAuth] Camera permissions not granted. Requesting camera permissions...');
       const granted = await requestPermission();
+      console.log(`[FaceAuth] Camera permissions response: ${granted}`);
       if (!granted) {
         Alert.alert(
           'Camera Required',
@@ -261,7 +350,11 @@ export default function EnrollScreen() {
         );
         return;
       }
+    } else {
+      console.log('[FaceAuth] Camera permissions already granted.');
     }
+    
+    console.log('[FaceAuth] Initializing camera session and resetting pipeline state variables.');
     // Reset pipeline state
     capturePhase.value = 0;
     stableCount.value = 0;
@@ -269,6 +362,7 @@ export default function EnrollScreen() {
     lastFaceY.value = -1;
     movementSum.value = 0;
     embeddingCount.value = 0;
+    frameCount.value = 0;
     embeddingBuffer.current = [];
     setStatusText('Position your face in the frame');
     setProgress(0);
@@ -341,15 +435,76 @@ export default function EnrollScreen() {
         />
 
         {/* ── Overlay ── */}
-        <SafeAreaView style={s.overlay}>
-          <TouchableOpacity
-            style={s.closeBtn}
-            onPress={() => setPhase('form')}
-          >
-            <Text style={s.closeBtnText}>✕</Text>
-          </TouchableOpacity>
+        <SafeAreaView style={s.overlay} pointerEvents="box-none">
+          <View style={s.topHeader}>
+            <TouchableOpacity
+              style={s.closeBtn}
+              onPress={() => setPhase('form')}
+            >
+              <Text style={s.closeBtnText}>✕</Text>
+            </TouchableOpacity>
 
-          <View style={s.frameGuideContainer}>
+            {modelsReady && (
+              <View style={s.stepperContainer}>
+                {/* Step 1: Detect */}
+                <View style={s.stepItem}>
+                  <View style={[
+                    s.stepBadge,
+                    progress < 0.1 ? s.stepActive : s.stepCompleted
+                  ]}>
+                    <Text style={s.stepBadgeText}>1</Text>
+                  </View>
+                  <Text style={[
+                    s.stepLabelText,
+                    progress < 0.1 ? s.stepLabelActive : s.stepLabelCompleted
+                  ]}>Detect</Text>
+                </View>
+
+                {/* Connector 1 */}
+                <View style={[
+                  s.stepConnector,
+                  progress >= 0.1 ? s.stepConnectorCompleted : s.stepConnectorInactive
+                ]} />
+
+                {/* Step 2: Liveness */}
+                <View style={s.stepItem}>
+                  <View style={[
+                    s.stepBadge,
+                    progress >= 0.1 && progress <= 0.5 ? s.stepActive : (progress > 0.5 ? s.stepCompleted : s.stepInactive)
+                  ]}>
+                    <Text style={s.stepBadgeText}>2</Text>
+                  </View>
+                  <Text style={[
+                    s.stepLabelText,
+                    progress >= 0.1 && progress <= 0.5 ? s.stepLabelActive : (progress > 0.5 ? s.stepLabelCompleted : s.stepLabelInactive)
+                  ]}>Liveness</Text>
+                </View>
+
+                {/* Connector 2 */}
+                <View style={[
+                  s.stepConnector,
+                  progress > 0.5 ? s.stepConnectorCompleted : s.stepConnectorInactive
+                ]} />
+
+                {/* Step 3: Capture */}
+                <View style={s.stepItem}>
+                  <View style={[
+                    s.stepBadge,
+                    progress > 0.5 && progress < 1.0 ? s.stepActive : (progress >= 1.0 ? s.stepCompleted : s.stepInactive)
+                  ]}>
+                    <Text style={s.stepBadgeText}>3</Text>
+                  </View>
+                  <Text style={[
+                    s.stepLabelText,
+                    progress > 0.5 && progress < 1.0 ? s.stepLabelActive : (progress >= 1.0 ? s.stepLabelCompleted : s.stepLabelInactive)
+                  ]}>Capture</Text>
+                </View>
+              </View>
+            )}
+            <View style={{ width: 44 }} />
+          </View>
+
+          <View style={s.frameGuideContainer} pointerEvents="none">
             <View style={s.frameGuide}>
               <View style={[s.corner, s.cornerTL]} />
               <View style={[s.corner, s.cornerTR]} />
@@ -366,13 +521,18 @@ export default function EnrollScreen() {
               </>
             ) : (
               <>
-                <Text style={s.statusLabel}>{statusText}</Text>
+                <View style={s.statusLabelContainer}>
+                  <Text style={s.statusLabel}>{statusText}</Text>
+                  <Text style={s.percentageLabel}>{Math.round(progress * 100)}%</Text>
+                </View>
                 <View style={s.progressTrack}>
                   <View
                     style={[
                       s.progressFill,
                       { width: `${Math.min(100, progress * 100)}%` },
-                      progress >= 1 && s.progressComplete,
+                      progress >= 0.1 && progress <= 0.5 && s.progressActive,
+                      progress > 0.5 && s.progressCapture,
+                      progress >= 1.0 && s.progressComplete,
                     ]}
                   />
                 </View>
@@ -501,10 +661,14 @@ const s = StyleSheet.create({
     ...StyleSheet.absoluteFill,
     justifyContent: 'space-between',
   },
-  closeBtn: {
-    alignSelf: 'flex-start',
+  topHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
     marginTop: 8,
-    marginLeft: 16,
+    width: '100%',
+  },
+  closeBtn: {
     width: 44,
     height: 44,
     borderRadius: 22,
@@ -513,6 +677,76 @@ const s = StyleSheet.create({
     justifyContent: 'center',
   },
   closeBtnText: { color: '#FFF', fontSize: 20, fontWeight: '600' },
+  stepperContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(10, 10, 20, 0.75)',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    flex: 1,
+    marginHorizontal: 12,
+    justifyContent: 'center',
+  },
+  stepItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  stepBadge: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepBadgeText: {
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  stepLabelText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  stepConnector: {
+    height: 2,
+    flex: 1,
+    maxWidth: 24,
+    marginHorizontal: 6,
+    borderRadius: 1,
+  },
+  stepActive: {
+    backgroundColor: '#3B82F6', // active blue
+    shadowColor: '#3B82F6',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 4,
+  },
+  stepCompleted: {
+    backgroundColor: '#10B981', // green success
+  },
+  stepInactive: {
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+  },
+  stepLabelActive: {
+    color: '#3B82F6',
+    fontWeight: '700',
+  },
+  stepLabelCompleted: {
+    color: '#10B981',
+  },
+  stepLabelInactive: {
+    color: '#6B7280',
+  },
+  stepConnectorCompleted: {
+    backgroundColor: '#10B981',
+  },
+  stepConnectorInactive: {
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+  },
 
   frameGuideContainer: {
     flex: 1,
@@ -570,6 +804,18 @@ const s = StyleSheet.create({
     fontWeight: '600',
     textAlign: 'center',
   },
+  statusLabelContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
+    alignItems: 'center',
+    paddingHorizontal: 4,
+  },
+  percentageLabel: {
+    color: '#3B82F6',
+    fontWeight: '700',
+    fontSize: 14,
+  },
   progressTrack: {
     width: '100%',
     height: 6,
@@ -581,6 +827,12 @@ const s = StyleSheet.create({
     height: '100%',
     borderRadius: 3,
     backgroundColor: '#3B82F6',
+  },
+  progressActive: {
+    backgroundColor: '#3B82F6',
+  },
+  progressCapture: {
+    backgroundColor: '#F59E0B',
   },
   progressComplete: { backgroundColor: '#10B981' },
 

@@ -2,6 +2,8 @@ import { createMMKV } from 'react-native-mmkv';
 
 export const faceStorage = createMMKV({ id: 'datalake-face-db' });
 export const attendanceStorage = createMMKV({ id: 'datalake-attendance-logs' });
+export const adminStorage = createMMKV({ id: 'datalake-admin-config' });
+export const sessionStorage = createMMKV({ id: 'datalake-session-state' });
 
 export interface EmployeeRecord {
   name: string;
@@ -37,5 +39,47 @@ export const databaseWrapper = {
 
     logs.push(newEntry);
     attendanceStorage.set('logs', JSON.stringify(logs));
+  },
+
+  deleteEmployee: (empId: string) => {
+    const db = databaseWrapper.getEmployees();
+    if (db[empId]) {
+      delete db[empId];
+      faceStorage.set('employee_db', JSON.stringify(db));
+    }
+  },
+
+  purgeAttendanceRecords: () => {
+    attendanceStorage.set('logs', '[]');
+  },
+
+  getAdminConfig: () => {
+    const raw = adminStorage.getString('config');
+    return raw ? JSON.parse(raw) : null;
+  },
+
+  saveAdminConfig: (username: string, passwordHash: string) => {
+    adminStorage.set('config', JSON.stringify({ username, password_hash: passwordHash }));
+  },
+
+  getRememberMe: (): boolean => {
+    return sessionStorage.getBoolean('remember_me') ?? false;
+  },
+
+  saveRememberMe: (value: boolean) => {
+    sessionStorage.set('remember_me', value);
+  },
+
+  getSessionTimeout: (): number => {
+    return sessionStorage.getNumber('last_active') ?? 0;
+  },
+
+  saveSessionTimeout: (timestamp: number) => {
+    sessionStorage.set('last_active', timestamp);
+  },
+
+  clearSession: () => {
+    sessionStorage.set('remember_me', false);
+    sessionStorage.set('last_active', 0);
   }
 };

@@ -8,6 +8,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import { Ionicons } from '@expo/vector-icons';
 
 export default function DashboardScreen() {
   const router = useRouter();
@@ -18,6 +19,12 @@ export default function DashboardScreen() {
       <SafeAreaView style={styles.safeArea}>
         {/* ── Header ── */}
         <View style={styles.header}>
+          <TouchableOpacity 
+            style={styles.settingsIcon} 
+            onPress={() => router.push('/admin' as any)}
+          >
+            <Ionicons name="settings-outline" size={28} color="#6B7280" />
+          </TouchableOpacity>
           <Text style={styles.logoText}>DataLake</Text>
           <Text style={styles.tagline}>Offline Face Authentication</Text>
         </View>
@@ -86,6 +93,13 @@ const styles = StyleSheet.create({
     paddingTop: 48,
     paddingBottom: 52,
     alignItems: 'center',
+    position: 'relative',
+  },
+  settingsIcon: {
+    position: 'absolute',
+    top: 16,
+    right: 0,
+    padding: 8,
   },
   logoText: {
     fontSize: 38,

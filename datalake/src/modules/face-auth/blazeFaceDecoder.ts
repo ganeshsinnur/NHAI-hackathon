@@ -28,6 +28,7 @@ export interface FaceDetection {
 export function decodeFaces(
   output0: ArrayBuffer,
   output1: ArrayBuffer,
+  isThrottledFrame?: boolean,
 ): FaceDetection[] {
   'worklet';
 
@@ -46,7 +47,7 @@ export function decodeFaces(
   }
 
   const INPUT_SIZE = 128;
-  const SCORE_THRESH = 0.65;
+  const SCORE_THRESH = 0.45; // Lowered from 0.65 to 0.45 for much higher detection sensitivity under varied lighting/angles
   const IOU_THRESH = 0.3;
 
   // ── Generate 896 SSD anchors inline (<0.5 ms) ──────────────
@@ -83,10 +84,14 @@ export function decodeFaces(
   // ── Decode detections above score threshold ────────────────
   const candidates: FaceDetection[] = [];
   const numAnchors = anchorX.length; // 896
+  let maxScore = -1;
 
   for (let i = 0; i < numAnchors; i++) {
     const rawScore = classifiers[i];
     const score = 1.0 / (1.0 + Math.exp(-rawScore)); // sigmoid
+    if (score > maxScore) {
+      maxScore = score;
+    }
     if (score < SCORE_THRESH) continue;
 
     const off = i * 16;
@@ -103,6 +108,14 @@ export function decodeFaces(
       y2: Math.min(1, yCtr + h / 2),
       score,
     });
+  }
+
+  if (isThrottledFrame) {
+    console.log(
+      '[FaceAuth] [Decoder] Tensors size: Regressors=' + regressors.length + ', Classifiers=' + classifiers.length + 
+      ' | Max Anchor Score found in frame: ' + maxScore.toFixed(4) + ' (threshold is ' + SCORE_THRESH + ')' +
+      ' | Passed candidates: ' + candidates.length
+    );
   }
 
   // Sort by score descending
