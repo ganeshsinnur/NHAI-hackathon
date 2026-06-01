@@ -3,30 +3,106 @@ import { View, Text, StyleSheet, TouchableOpacity, ScrollView, Alert, TextInput 
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { databaseWrapper, attendanceStorage } from '@/modules/face-auth/database';
+import { databaseWrapper, attendanceStorage, adminStorage } from '@/modules/face-auth/database';
 import CryptoJS from 'crypto-js';
 
 export default function AdminSettingsScreen() {
   const router = useRouter();
-  const [serverUrl, setServerUrl] = useState('https://api.example.com/sync');
+  
+  // Load persisted server URL from MMKV or default to local development port
+  const [serverUrl, setServerUrl] = useState(() => {
+    return adminStorage.getString('server_url') ?? 'http://localhost:5000/api/v1/sync/attendance';
+  });
+
+  const updateServerUrl = (url: string) => {
+    setServerUrl(url);
+    adminStorage.set('server_url', url);
+  };
   
   const handleLogout = () => {
     databaseWrapper.clearSession();
     router.replace('/' as any); // Go back to login
   };
 
-  const handleSyncNow = () => {
-    Alert.alert('Sync Started', 'Uploading records to server...');
-    setTimeout(() => {
-      // Dummy sync logic
-      const rawLogs = attendanceStorage.getString('logs');
-      if (rawLogs) {
-        let logs = JSON.parse(rawLogs);
-        logs = logs.map((log: any) => ({ ...log, synced: true }));
-        attendanceStorage.set('logs', JSON.stringify(logs));
-        Alert.alert('Sync Complete', 'All records have been synchronized.');
+  const handleSyncNow = async () => {
+    const rawLogs = attendanceStorage.getString('logs');
+    if (!rawLogs) {
+      Alert.alert('No Data', 'There are no attendance records to synchronize.');
+      return;
+    }
+
+    const logs = JSON.parse(rawLogs);
+    // Sync only records that are currently unsynced
+    const unsyncedLogs = logs.filter((log: any) => !log.synced);
+
+    if (unsyncedLogs.length === 0) {
+      Alert.alert('Synced', 'All attendance records are already synchronized.');
+      return;
+    }
+
+    Alert.alert('Sync Started', `Uploading ${unsyncedLogs.length} record(s) to server...`);
+
+    try {
+      // Map local logs to match exact backend schema format with idempotency key
+      const records = unsyncedLogs.map((log: any) => {
+        const key = log.idempotency_key ?? `${log.employee_id}_${log.timestamp}`;
+        return {
+          employee_id: log.employee_id,
+          name: log.name,
+          timestamp: log.timestamp,
+          latitude: log.latitude ?? null,
+          longitude: log.longitude ?? null,
+          idempotency_key: key
+        };
+      });
+
+      const response = await fetch(serverUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          device_uuid: 'datalake_mobile_app',
+          records: records
+        })
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let parsedError;
+        try {
+          parsedError = JSON.parse(errorText);
+        } catch {
+          parsedError = { message: `HTTP status ${response.status}` };
+        }
+        throw new Error(parsedError.message || 'Server rejected synchronization request.');
       }
-    }, 1500);
+
+      const res = await response.json();
+
+      // Mark records successfully synced inside MMKV
+      const syncedKeys = new Set(records.map(r => r.idempotency_key));
+      const updatedLogs = logs.map((log: any) => {
+        const key = log.idempotency_key ?? `${log.employee_id}_${log.timestamp}`;
+        if (syncedKeys.has(key)) {
+          return { ...log, synced: true, idempotency_key: key };
+        }
+        return log;
+      });
+
+      attendanceStorage.set('logs', JSON.stringify(updatedLogs));
+
+      Alert.alert(
+        'Sync Complete',
+        `Successfully synced: ${res.synced_count} records\nDuplicates skipped: ${res.duplicate_count || 0}`
+      );
+    } catch (error: any) {
+      console.error('[Sync Error]', error);
+      Alert.alert(
+        'Sync Failed',
+        `Error: ${error.message || 'Could not connect to database server. Check your network.'}`
+      );
+    }
   };
 
   const handlePurge = () => {
@@ -101,7 +177,7 @@ export default function AdminSettingsScreen() {
             <TextInput
               style={s.input}
               value={serverUrl}
-              onChangeText={setServerUrl}
+              onChangeText={updateServerUrl}
               placeholder="Server URL"
               placeholderTextColor="#6B7280"
               autoCapitalize="none"

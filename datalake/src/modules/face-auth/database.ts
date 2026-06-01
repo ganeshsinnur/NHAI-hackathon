@@ -28,13 +28,15 @@ export const databaseWrapper = {
     const rawLogs = attendanceStorage.getString('logs');
     const logs = rawLogs ? JSON.parse(rawLogs) : [];
 
+    const nowIso = new Date().toISOString();
     const newEntry = {
       employee_id: empId,
       name: name,
-      timestamp: new Date().toISOString(),
+      timestamp: nowIso,
       latitude: locationObj?.latitude ?? null,
       longitude: locationObj?.longitude ?? null,
-      synced: false
+      synced: false,
+      idempotency_key: `${empId}_${nowIso}`
     };
 
     logs.push(newEntry);
